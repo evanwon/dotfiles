@@ -1,0 +1,2 @@
+# Disable bell (causes visual flash in Windows Terminal, likely others)
+set bell-style none
