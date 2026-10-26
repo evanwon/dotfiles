@@ -1,0 +1,11 @@
+{
+  "name": "evanwon-dotfiles",
+  "owner": { "name": "evanwon" },
+  "plugins": [
+    {
+      "name": "status-bar",
+      "source": "./.claude/mods/status-bar",
+      "description": "A status band above the prompt in Claude Code Desktop: git state, context, rate limits, cost, tokens and prompt-cache warmth."
+    }
+  ]
+}

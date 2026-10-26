@@ -7,5 +7,10 @@
 !.bash_aliases
 !.claude/
 !.claude/statusline-command.sh
+!.claude/mods/
+!.claude/mods/**
+.claude/mods/*/.claude-plugin/types/
+!.claude-plugin/
+!.claude-plugin/marketplace.json
 README.md
 LICENSE
