@@ -1,6 +1,6 @@
 # dotfiles
 
-My configuration for the tools I use every day, plus two add-ons for Claude Code.
+These are my personal dotfiles and other configs I like. Maybe you'll like them too.
 
 ## Claude Code status line and status bar
 
