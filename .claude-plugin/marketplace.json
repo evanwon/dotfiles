@@ -1,6 +1,6 @@
 {
   "name": "evanwon-dotfiles",
-  "owner": { "name": "evanwon" },
+  "owner": { "name": "Evan Wondrasek" },
   "plugins": [
     {
       "name": "status-bar",
