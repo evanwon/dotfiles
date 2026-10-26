@@ -2,7 +2,10 @@
 *
 !.vimrc
 !.gitignore
+!.gitattributes
 !.bashrc
 !.bash_aliases
+!.claude/
+!.claude/statusline-command.sh
 README.md
 LICENSE
