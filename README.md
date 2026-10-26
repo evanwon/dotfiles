@@ -1,42 +1,63 @@
-dotfiles
-========
+# dotfiles
 
-These are my dotfiles. I probably didn't create all of these.
+My configuration for the tools I use every day, plus two add-ons for Claude Code.
 
-Claude Code
------------
+## Claude Code status line and status bar
 
-`.claude/statusline-command.sh` is the terminal status line; copy it to `~/.claude/` and
-enable it as its header comment describes.
+Both show the same things at a glance: the repo and branch you're in, how much of the
+context window you've used, how close you are to your rate limits, what the session has
+cost so far, and whether the prompt cache is still warm. One is for the terminal, the
+other for the desktop app.
 
-`.claude/mods/status-bar` is its counterpart for Claude Code Desktop: a band above the
-prompt with git state, context, rate limits, cost, tokens and prompt-cache warmth. It
-stays gray until a gauge passes its threshold; click a label (`ctx`, `5h`, the branch,
-the cost) to see that piece's exact figures.
+### Terminal: `.claude/statusline-command.sh`
 
-### Installing the status bar
+A two-line status line. Requires bash 5, git, jq and GNU coreutils (Linux, or Git Bash
+on Windows). Copy it to `~/.claude/` and add this to `~/.claude/settings.json`:
 
-Needs `git` and `jq` on the `PATH` (jq reads the session's token totals from its
-transcript). This repo is a plugin marketplace, so the mod installs from GitHub and
-Claude Code keeps its own copy: it doesn't matter where, or whether, this repo is checked
-out. Once per machine, from a shell:
-
+```json
+"statusLine": {
+  "type": "command",
+  "command": "bash ~/.claude/statusline-command.sh",
+  "refreshInterval": 60
+}
 ```
+
+### Desktop: `.claude/mods/status-bar`
+
+One line above the prompt in Claude Code Desktop. It stays gray until something needs
+your attention: context past 50%, or a rate limit past 60%. Click any label to see the
+exact numbers.
+
+It needs `git` and `jq` on your `PATH`. Install it once per machine:
+
+```bash
 claude plugin install status-bar --marketplace evanwon/dotfiles
 ```
 
-Answer `y` to add the `evanwon/dotfiles` marketplace. It installs at user scope, so every
-session loads it, desktop sessions included; the band draws in the desktop app only, as
-the terminal has the script.
+Or, in the desktop app: **+** next to the prompt box → **Plugins** → **Add marketplace**
+`evanwon/dotfiles` → **Add plugin** on `status-bar`.
 
-From the desktop app instead: click **+** next to the prompt box, then **Plugins**,
-**Add marketplace** with `evanwon/dotfiles`, then **Add plugin** on `status-bar`.
-
-The cache countdown assumes a 1-hour prompt-cache lifetime. On 5-minute caching, add
-`--config cacheTtl=5m` to the install, or change it later with
+The cache timer assumes a one-hour cache. If you use five-minute caching, add
+`--config cacheTtl=5m` to the install command, or change it later with
 `claude plugin configure status-bar`.
 
-### Updating and removing
+To update: `claude plugin update status-bar`. To remove: `claude plugin uninstall status-bar`.
 
-After pushing a change to `main`, `claude plugin update status-bar` picks it up in new
-sessions. `claude plugin uninstall status-bar` removes it.
+## Shell and terminal
+
+| File | What it does |
+|---|---|
+| `shell/evanw.zsh-theme` | An oh-my-zsh prompt: an arrow that turns red after a failed command, the git branch with a mark when there are uncommitted changes, and the current directory on the right. |
+| `shell/inputrc` | Turns off the terminal bell, which flashes the screen in Windows Terminal. |
+| `iterm2/profile.json` | My iTerm2 profile with the Dracula colors. Import it from **Settings → Profiles → Other Actions → Import JSON Profiles**. |
+
+Link or copy them where your tools expect them, for example:
+
+```bash
+ln -s ~/src/dotfiles/shell/inputrc ~/.inputrc
+ln -s ~/src/dotfiles/shell/evanw.zsh-theme ~/.oh-my-zsh/custom/themes/
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
