@@ -6,6 +6,11 @@
       "name": "status-bar",
       "source": "./.claude/mods/status-bar",
       "description": "A status band above the prompt in Claude Code Desktop: git state, context, rate limits, cost, tokens and prompt-cache warmth."
+    },
+    {
+      "name": "cache-alert",
+      "source": "./.claude/mods/cache-alert",
+      "description": "A desktop notification shortly before a session's prompt cache goes cold, when that session is waiting on you and has a large context."
     }
   ]
 }

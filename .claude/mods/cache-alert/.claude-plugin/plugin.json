@@ -1,0 +1,22 @@
+{
+  "name": "cache-alert",
+  "version": "0.1.0",
+  "description": "A desktop notification shortly before a session's prompt cache goes cold, when that session is waiting on you and has a large context.",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "cacheTtl": {
+      "type": "string",
+      "title": "Prompt cache TTL",
+      "description": "How long the prompt cache stays warm after a response; the engine doesn't report it to mods.",
+      "default": "1h",
+      "options": ["1h", "5m"]
+    },
+    "minContextTokens": {
+      "type": "number",
+      "title": "Smallest context worth an alert",
+      "description": "Below this many tokens of context, a cold cache is cheap to rebuild, so no alert.",
+      "default": 75000
+    }
+  }
+}

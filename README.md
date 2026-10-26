@@ -43,6 +43,41 @@ The cache timer assumes a one-hour cache. If you use five-minute caching, add
 
 To update: `claude plugin update status-bar`. To remove: `claude plugin uninstall status-bar`.
 
+## Claude Code cache alert: `.claude/mods/cache-alert`
+
+A notification ten minutes before a session's prompt cache goes cold, so you can reply
+while the cache is still warm. Once the cache expires, the next message has to send the
+whole context again at full price.
+
+It only alerts when both of these are true:
+
+- **The session is waiting on you.** Its last turn ended on a question (the desktop
+  app's next-step question, or a final line ending in `?`), is still showing a question
+  or a plan for you to approve, stopped with steps left on its task list, or failed on
+  an API error. A turn that ends with just a summary counts as done. Only a message from
+  you counts as an answer: a turn something else started, like a background task's
+  notice, keeps the session waiting.
+- **The context is large**: at least 75,000 tokens by default. Below that, rebuilding
+  the cache costs little.
+
+You get at most one alert each time a session goes idle. On Windows it's a toast from
+the Claude app that stays on screen until you click it (which opens Claude) or press
+**Dismiss**. Elsewhere it goes through Claude Code's own terminal notification.
+
+Type `/cache-alert` in a session to see whether it would get an alert and to send a
+test notification.
+
+Install it once per machine:
+
+```bash
+claude plugin install cache-alert --marketplace evanwon/dotfiles
+```
+
+Like the status bar, it assumes a one-hour cache. Change that with `cacheTtl=5m`, which
+alerts two minutes ahead instead, and the token threshold with `minContextTokens`. Pass
+either as `--config` to the install command, or change it later with
+`claude plugin configure cache-alert`.
+
 ## Shell and terminal
 
 | File | What it does |
