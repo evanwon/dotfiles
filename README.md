@@ -105,6 +105,27 @@ ln -s ~/src/dotfiles/shell/inputrc ~/.inputrc
 ln -s ~/src/dotfiles/shell/evanw.zsh-theme ~/.oh-my-zsh/custom/themes/
 ```
 
+## Checks before a push
+
+`scripts/hooks/pre-push` checks each commit being pushed, exported from git so
+uncommitted changes don't count: `claude plugin validate`, `claude plugin test` and
+`tsc` for each mod, `bash -n` on the status line script, and that
+`.claude-plugin/marketplace.json` parses and names folders that exist. A failure
+refuses the push. It takes about 20 seconds and needs `claude`, `jq` and Node (`npx`)
+on your `PATH`. There's no CI: this hook is the check.
+
+A Claude Code session in this repo turns it on (`.claude/settings.json` sets
+`core.hooksPath` when the session starts). Elsewhere, turn it on once with:
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
+`tsc` needs this Claude Code version's mod types. There's no command that writes them:
+the engine writes them to a temp folder when the `plugin-authoring` skill loads. The hook keeps a copy in `~/.cache/dotfiles/` once it finds them. Until then it
+skips `tsc` and says so; loading the skill once (ask a session to make or change a mod)
+fixes that, and again after each Claude Code update.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

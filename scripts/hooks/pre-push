@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Git pre-push hook, the per-change gate: CI doesn't run on pushes. For each commit being pushed it checks that commit's
+# tree, exported to a temp folder, not the working tree:
+#   - each mod under .claude/mods: claude plugin validate, claude plugin test, and tsc against this Claude Code
+#     version's types (skipped, with a notice, when they can't be found; see find_types);
+#   - bash -n on the status line script;
+#   - .claude-plugin/marketplace.json parses and each plugin's source folder exists.
+# Deletions pass through. Needs claude, jq and node (npx) on PATH.
+# The Claude Code session hook turns it on (.claude/settings.json); by hand: git config core.hooksPath scripts/hooks.
+set -euo pipefail
+TOP=$(git rev-parse --show-toplevel)
+ZERO=0000000000000000000000000000000000000000
+TYPESCRIPT=typescript@5.9.3
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/dotfiles"
+
+for tool in claude jq npx; do
+  command -v "$tool" >/dev/null || { echo "pre-push: $tool isn't on PATH, so the checks can't run" >&2; exit 1; }
+done
+VERSION=$(claude --version | awk '{ print $1 }')
+
+# The types a mod is checked against. The engine writes them only beside a mod it loads from a folder, and as
+# claude-code.d.ts (the API plus the built-in tools) under its temp folder whenever the plugin-authoring skill loads.
+# A copy for this version is kept in $CACHE, since the temp folder gets cleaned.
+find_types() {
+  local cached="$CACHE/claude-code-$VERSION.d.ts" root f
+  [ -f "$cached" ] && { echo "$cached"; return; }
+  for root in ${CLAUDE_CODE_TMPDIR:+"$CLAUDE_CODE_TMPDIR"} ${TMPDIR:+"$TMPDIR"} /tmp; do
+    command -v cygpath >/dev/null && root=$(cygpath -u "$root")
+    for f in "$root"/claude*/bundled-skills/"$VERSION"/*/plugin-authoring/types/claude-code.d.ts; do
+      if [ -f "$f" ] && [ "$(head -n 1 "$f")" = "// Written by Claude Code $VERSION." ]; then
+        mkdir -p "$CACHE" && cp "$f" "$cached" && echo "$cached"
+        return
+      fi
+    done
+  done
+}
+
+check() {   # runs in a folder holding the tree to check
+  local mod name failed=""
+  run() {   # $1 = what it checks, then the command; its output is shown only when it fails
+    if "${@:2}" >check.log 2>&1; then echo "pre-push: ok   $1" >&2
+    else cat check.log >&2; echo "pre-push: FAIL $1" >&2; failed=1; fi
+  }
+
+  for mod in .claude/mods/*/; do
+    mod=${mod%/}; name=${mod##*/}
+    run "$name: claude plugin validate" claude plugin validate "$mod"
+    run "$name: claude plugin test" claude plugin test "$mod"
+    if [ -n "$types" ]; then
+      # The options the types file's header gives; relative paths, so tsc on Windows reads them too.
+      jq -n --arg mod "$mod" '{
+        compilerOptions: { target: "es2023", lib: ["es2023"], types: [], module: "esnext", moduleResolution: "bundler",
+          strict: true, noUncheckedIndexedAccess: true, noEmit: true, skipLibCheck: true,
+          jsx: "react", jsxFactory: "h", jsxFragmentFactory: "Fragment" },
+        include: ["claude-code.d.ts", "\($mod)/hooks", "\($mod)/types", "\($mod)/tests"] }' >"tsconfig.$name.json"
+      run "$name: tsc" npx --yes --package "$TYPESCRIPT" tsc -p "tsconfig.$name.json"
+    fi
+  done
+
+  run ".claude/statusline-command.sh: bash -n" bash -n .claude/statusline-command.sh
+  run ".claude-plugin/marketplace.json: parses, sources exist" marketplace
+
+  [ -z "$failed" ]
+}
+
+marketplace() {
+  local sources source
+  sources=$(jq -er '.plugins[].source' .claude-plugin/marketplace.json | tr -d '\r') || return 1   # jq on Windows ends lines with CRLF
+  while read -r source; do
+    [ -d "$source" ] || { echo "no folder at $source" >&2; return 1; }
+  done <<<"$sources"
+}
+
+shas=()
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  [ "$local_sha" != "$ZERO" ] && [[ " ${shas[*]} " != *" $local_sha "* ]] && shas+=("$local_sha")
+done
+[ ${#shas[@]} -gt 0 ] || exit 0
+
+types=$(find_types || true)
+[ -n "$types" ] || echo "pre-push: skipping tsc: no types for Claude Code $VERSION yet (loading the plugin-authoring skill once writes them)" >&2
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+status=0
+for sha in "${shas[@]}"; do
+  dir="$tmp/${sha:0:12}"
+  mkdir -p "$dir"
+  git -C "$TOP" archive "$sha" | tar -x -C "$dir"
+  [ -z "$types" ] || cp "$types" "$dir/claude-code.d.ts"
+  echo "pre-push: checking ${sha:0:12}" >&2
+  (cd "$dir" && check) || status=1
+done
+[ $status -eq 0 ] || echo "pre-push: refused; fix the failures above and push again" >&2
+exit $status
