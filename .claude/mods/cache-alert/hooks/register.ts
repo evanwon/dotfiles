@@ -22,7 +22,7 @@ import type { Waiting } from '../types'
 // Once the cache has gone cold, a message of the person's waits on a question first:
 //   The prompt cache went cold 12 min ago, so this message re-sends the 240k-token
 //   context uncached. Send it anyway?   [Send] [Cancel]
-// Cancel holds it back, on the clipboard where the surface has one.
+// Cancel holds it back, and the desktop app keeps it in the message box.
 
 const MINUTE = 60_000
 const WRAP_UP = 'mcp__ccd_turn__wrap_up'
@@ -312,7 +312,7 @@ function fmtAgo(ms: number): string {
 // Whether a prompt of the person's may go out now: on a cold cache with a large
 // context it asks first. Resolves to why it was held back, or null to send it.
 // With nobody to ask (a -p run) it goes; a dialog closed unanswered holds it.
-async function holdCold($: EngineInterface, text: string, hasMedia: boolean): Promise<string | null> {
+async function holdCold($: EngineInterface): Promise<string | null> {
   const [last, now, usage, surfaces] = await Promise.all([
     read($, lastResponseAt),
     $.clock.now(),
@@ -328,11 +328,7 @@ async function holdCold($: EngineInterface, text: string, hasMedia: boolean): Pr
     `The prompt cache went cold ${fmtAgo(coldFor)} ago, so this message re-sends the ` +
     `${fmtTok(ctx)}-token context uncached. Send it anyway?`
   const answer = await $.ui.ask(question, { options: ['Send', 'Cancel'], header: 'Cold cache' }).catch(() => 'Cancel')
-  if (answer === 'Send') return null
-
-  const lost = hasMedia ? ' Its attachments were not kept.' : ''
-  const copied = await $.ui.copy({ text }).then(r => r.isCopied, () => false)
-  return copied ? `Not sent; your message is on the clipboard.${lost}` : `Not sent.${lost} Your message:\n${text}`
+  return answer === 'Send' ? null : 'Not sent: the prompt cache is cold.'
 }
 
 // Sets the one timer for `last`'s expiry, less the lead time
@@ -369,7 +365,7 @@ export const register: Register = (on, options) => {
     // A slash command or a prompt typed over a running turn passes: the one may not
     // reach the model, and the other finds the cache warm
     if (coldGate && !e.command && !e.isMeta && e.turnId === undefined) {
-      const held = await holdCold($, e.text, (e.attachments?.length ?? 0) > 0)
+      const held = await holdCold($)
       if (held !== null) return { drop: held }
     }
     fromPerson = true

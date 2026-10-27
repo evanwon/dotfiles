@@ -13,8 +13,8 @@ const TRANSCRIPT = 'C:/Users/me/.claude/projects/C--src-dotfiles/s1.jsonl'
 // context, a model that answers each step, tools that return at once (but an
 // AskUserQuestion, held until `answer()`), and a notification channel that keeps
 // what it's sent. With `pick`, an AskUserQuestion is answered with that label at
-// once ('dismiss' closes it instead); `asked` keeps the questions. The clipboard
-// takes text unless `canCopy` is false. It draws on the desktop unless `surfaces`
+// once ('dismiss' closes it instead); `asked` keeps the questions, `copied` what
+// reached the clipboard. It draws on the desktop unless `surfaces`
 // says otherwise. No OS variable unless given, so not Windows. With `transcript`,
 // the session has one on disk, and jq reads it as those records.
 function engine(
@@ -25,14 +25,12 @@ function engine(
     transcript,
     surfaces = ['desktop'],
     pick,
-    canCopy = true,
   }: {
     ctx?: number
     env?: Record<string, string>
     transcript?: object[]
     surfaces?: ('desktop' | 'terminal')[]
     pick?: string
-    canCopy?: boolean
   } = {},
 ) {
   const clock = mock.clock(on, { now: START })
@@ -82,8 +80,8 @@ function engine(
     return { result: { questions: e.questions, answers: { [question]: pick } } }
   })
   on('ui.copy', (_, e) => {
-    if (canCopy) copied.push(e.text)
-    return { value: canCopy ? { isCopied: true as const } : { isCopied: false as const, reason: 'no-surface' } }
+    copied.push(e.text)
+    return { value: { isCopied: true as const } }
   })
   on('ui.notify', (_, e) => {
     sent.push({ title: e.title, text: e.text })
@@ -381,21 +379,21 @@ test('a prompt on a cold cache asks first, and Send sends it', async ($, on) => 
   expect(asked).toEqual([COLD_Q])
 })
 
-test('Cancel holds the prompt back with the text on the clipboard', async ($, on) => {
+test('Cancel holds the prompt back and leaves the clipboard alone', async ($, on) => {
   const { clock, copied } = engine(on, { pick: 'Cancel' })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
   await turn($, [wrapUp()])
   await clock.advance(70 * MINUTE)
-  expect(await say($, 'Carry on')).toEqual({ drop: 'Not sent; your message is on the clipboard.' })
-  expect(copied).toEqual(['Carry on'])
+  expect(await say($, 'Carry on')).toEqual({ drop: 'Not sent: the prompt cache is cold.' })
+  expect(copied).toEqual([])
 })
 
-test("where the clipboard can't take it, the notice shows the message; closing the dialog cancels", async ($, on) => {
-  const { clock } = engine(on, { pick: 'dismiss', canCopy: false })
+test('closing the dialog cancels', async ($, on) => {
+  const { clock } = engine(on, { pick: 'dismiss' })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
   await turn($, [wrapUp()])
   await clock.advance(70 * MINUTE)
-  expect(await say($, 'Carry on')).toEqual({ drop: 'Not sent. Your message:\nCarry on' })
+  expect(await say($, 'Carry on')).toEqual({ drop: 'Not sent: the prompt cache is cold.' })
 })
 
 test('no question while warm, for a command, a notice or a prompt typed mid-turn', async ($, on) => {

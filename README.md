@@ -69,9 +69,8 @@ test notification.
 
 If the cache has already gone cold, the mod asks before your next message goes out:
 it names how long ago the cache went cold and how much context the message re-sends,
-with **Send** and **Cancel**. Cancel holds the message back and puts it on the
-clipboard, or shows it back to you where the app has no clipboard to give it.
-Attachments aren't kept. It only asks when the context meets the same 75,000-token
+with **Send** and **Cancel**. Cancel holds the message back, and the desktop app keeps
+it in the message box. It only asks when the context meets the same 75,000-token
 threshold, and it skips slash commands, messages typed while Claude is still working,
 and runs where nobody can answer (`claude -p`). Turn it off with `coldGate=false`.
 
