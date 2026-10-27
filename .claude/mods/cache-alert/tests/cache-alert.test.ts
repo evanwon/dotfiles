@@ -12,13 +12,31 @@ const TRANSCRIPT = 'C:/Users/me/.claude/projects/C--src-dotfiles/s1.jsonl'
 // The engine beneath the plugin: a session in C:\src\dotfiles with `ctx` tokens of
 // context, a model that answers each step, tools that return at once (but an
 // AskUserQuestion, held until `answer()`), and a notification channel that keeps
-// what it's sent. No OS variable unless given, so not Windows. With `transcript`,
+// what it's sent. With `pick`, an AskUserQuestion is answered with that label at
+// once ('dismiss' closes it instead); `asked` keeps the questions. The clipboard
+// takes text unless `canCopy` is false. It draws on the desktop unless `surfaces`
+// says otherwise. No OS variable unless given, so not Windows. With `transcript`,
 // the session has one on disk, and jq reads it as those records.
 function engine(
   on: On,
-  { ctx = 240_000, env = {}, transcript }: { ctx?: number; env?: Record<string, string>; transcript?: object[] } = {},
+  {
+    ctx = 240_000,
+    env = {},
+    transcript,
+    surfaces = ['desktop'],
+    pick,
+    canCopy = true,
+  }: {
+    ctx?: number
+    env?: Record<string, string>
+    transcript?: object[]
+    surfaces?: ('desktop' | 'terminal')[]
+    pick?: string
+    canCopy?: boolean
+  } = {},
 ) {
   const clock = mock.clock(on, { now: START })
+  on('session.surfaces', () => ({ value: surfaces }))
   mock.env(on, transcript ? { ...env, USERPROFILE: 'C:\\Users\\me' } : env)
   const jq = { runs: 0 }
   if (transcript) {
@@ -53,14 +71,25 @@ function engine(
     }
   })
   on('turn.complete', () => ({ text: '' }))
-  on('tool.call', (_, e) =>
-    e.tool === 'AskUserQuestion' ? new Promise(resolve => (answer = () => resolve({ result: {} }))) : { result: {} },
-  )
+  const asked: string[] = []
+  const copied: string[] = []
+  on('tool.call', (_, e) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    if (pick === undefined) return new Promise(resolve => (answer = () => resolve({ result: {} })))
+    const question = e.questions[0]?.question ?? ''
+    asked.push(question)
+    if (pick === 'dismiss') throw new Error('dismissed')
+    return { result: { questions: e.questions, answers: { [question]: pick } } }
+  })
+  on('ui.copy', (_, e) => {
+    if (canCopy) copied.push(e.text)
+    return { value: canCopy ? { isCopied: true as const } : { isCopied: false as const, reason: 'no-surface' } }
+  })
   on('ui.notify', (_, e) => {
     sent.push({ title: e.title, text: e.text })
     return { value: { isSent: true as const, channel: 'iterm2' as const } }
   })
-  return { clock, sent, jq, answer: () => answer() }
+  return { clock, sent, jq, asked, copied, answer: () => answer() }
 }
 
 // Transcript records as the mod's jq pass emits them
@@ -335,4 +364,79 @@ test('a session that already holds its state skips the transcript', async ($, on
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.settle()
   expect(jq.runs).toBe(1)
+})
+
+// The gate before a prompt on a cold cache
+
+const COLD_Q = 'The prompt cache went cold 10 min ago, so this message re-sends the 240k-token context uncached. Send it anyway?'
+
+const say = ($: Engine, text: string) => $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+
+test('a prompt on a cold cache asks first, and Send sends it', async ($, on) => {
+  const { clock, asked } = engine(on, { pick: 'Send' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
+  await turn($, [wrapUp()])
+  await clock.advance(70 * MINUTE)
+  expect(await say($, 'Carry on')).toEqual({ text: 'Carry on' })
+  expect(asked).toEqual([COLD_Q])
+})
+
+test('Cancel holds the prompt back with the text on the clipboard', async ($, on) => {
+  const { clock, copied } = engine(on, { pick: 'Cancel' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
+  await turn($, [wrapUp()])
+  await clock.advance(70 * MINUTE)
+  expect(await say($, 'Carry on')).toEqual({ drop: 'Not sent; your message is on the clipboard.' })
+  expect(copied).toEqual(['Carry on'])
+})
+
+test("where the clipboard can't take it, the notice shows the message; closing the dialog cancels", async ($, on) => {
+  const { clock } = engine(on, { pick: 'dismiss', canCopy: false })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
+  await turn($, [wrapUp()])
+  await clock.advance(70 * MINUTE)
+  expect(await say($, 'Carry on')).toEqual({ drop: 'Not sent. Your message:\nCarry on' })
+})
+
+test('no question while warm, for a command, a notice or a prompt typed mid-turn', async ($, on) => {
+  const { clock, asked } = engine(on, { pick: 'Cancel' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
+  await turn($, [wrapUp()])
+  await clock.advance(59 * MINUTE)
+  expect(await say($, 'Still warm')).toEqual({ text: 'Still warm' })
+  await clock.advance(11 * MINUTE)
+  const command = await $.prompt.submit({ text: '/clear', wait: false, origin: { kind: 'composer' }, command: { name: 'clear', args: '' } } as never)
+  expect(command).toEqual({ text: '/clear' })
+  const notice = await $.prompt.submit({ text: 'Task done', wait: false, origin: { kind: 'task-notification' } } as never)
+  expect(notice).toEqual({ text: 'Task done' })
+  const midTurn = await $.prompt.submit({ text: 'Also this', wait: false, origin: { kind: 'composer' }, turnId: 't9' } as never)
+  expect(midTurn).toEqual({ text: 'Also this' })
+  expect(asked).toEqual([])
+})
+
+test('a small context goes through without a question', async ($, on) => {
+  const { clock, asked } = engine(on, { ctx: 40_000, pick: 'Cancel' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
+  await turn($, [wrapUp()])
+  await clock.advance(70 * MINUTE)
+  expect(await say($, 'Carry on')).toEqual({ text: 'Carry on' })
+  expect(asked).toEqual([])
+})
+
+test('with nobody to ask (a -p run), the prompt goes through', async ($, on) => {
+  const { clock, asked } = engine(on, { surfaces: [], pick: 'Cancel' })
+  await $.session.start({ cwd: '/', surface: null, isInteractive: false })
+  await turn($, [wrapUp()])
+  await clock.advance(70 * MINUTE)
+  expect(await say($, 'Carry on')).toEqual({ text: 'Carry on' })
+  expect(asked).toEqual([])
+})
+
+test('the coldGate setting turns it off', { options: { coldGate: false } }, async ($, on) => {
+  const { clock, asked } = engine(on, { pick: 'Cancel' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
+  await turn($, [wrapUp()])
+  await clock.advance(70 * MINUTE)
+  expect(await say($, 'Carry on')).toEqual({ text: 'Carry on' })
+  expect(asked).toEqual([])
 })

@@ -17,6 +17,12 @@
       "title": "Smallest context worth an alert",
       "description": "Below this many tokens of context, a cold cache is cheap to rebuild, so no alert.",
       "default": 75000
+    },
+    "coldGate": {
+      "type": "boolean",
+      "title": "Ask before sending on a cold cache",
+      "description": "Before a message goes out on a cold cache with at least the alert's context size, ask whether to send it, since it re-sends the whole context uncached.",
+      "default": true
     }
   }
 }

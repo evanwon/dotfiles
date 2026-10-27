@@ -67,6 +67,14 @@ the Claude app that stays on screen until you click it (which opens Claude) or p
 Type `/cache-alert` in a session to see whether it would get an alert and to send a
 test notification.
 
+If the cache has already gone cold, the mod asks before your next message goes out:
+it names how long ago the cache went cold and how much context the message re-sends,
+with **Send** and **Cancel**. Cancel holds the message back and puts it on the
+clipboard, or shows it back to you where the app has no clipboard to give it.
+Attachments aren't kept. It only asks when the context meets the same 75,000-token
+threshold, and it skips slash commands, messages typed while Claude is still working,
+and runs where nobody can answer (`claude -p`). Turn it off with `coldGate=false`.
+
 When a session's process starts over, for example when the desktop app relaunches,
 the mod rebuilds what it knew from the session's transcript, so an alert that's still
 due still comes. If you reopen a session inside its last ten minutes, it doesn't alert,

@@ -19,6 +19,10 @@ import type { Waiting } from '../types'
 // it goes through $.ui.notify, which reaches a terminal.
 // The state lives in the session's process, so a new process (the desktop app
 // relaunched) rebuilds it by replaying the transcript's turns through the same rules.
+// Once the cache has gone cold, a message of the person's waits on a question first:
+//   The prompt cache went cold 12 min ago, so this message re-sends the 240k-token
+//   context uncached. Send it anyway?   [Send] [Cancel]
+// Cancel holds it back, on the clipboard where the surface has one.
 
 const MINUTE = 60_000
 const WRAP_UP = 'mcp__ccd_turn__wrap_up'
@@ -31,6 +35,7 @@ const alertedFor = atom({ plugin: 'cache-alert', key: 'alertedFor' } as const, n
 let ttlMs = 60 * MINUTE
 let leadMs = 10 * MINUTE
 let minTokens = 75_000
+let coldGate = true
 let timer: Timer | null = null
 
 // This turn's wrap-up: whether there was one, and the question it asked
@@ -296,6 +301,40 @@ async function recover($: EngineInterface) {
   await arm($, at)
 }
 
+// Compact span: 12 min, 3 h, 2 days
+function fmtAgo(ms: number): string {
+  const mins = Math.max(1, Math.round(ms / MINUTE))
+  if (mins < 120) return `${mins} min`
+  const hours = Math.round(mins / 60)
+  return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`
+}
+
+// Whether a prompt of the person's may go out now: on a cold cache with a large
+// context it asks first. Resolves to why it was held back, or null to send it.
+// With nobody to ask (a -p run) it goes; a dialog closed unanswered holds it.
+async function holdCold($: EngineInterface, text: string, hasMedia: boolean): Promise<string | null> {
+  const [last, now, usage, surfaces] = await Promise.all([
+    read($, lastResponseAt),
+    $.clock.now(),
+    $.session.usage(),
+    $.session.surfaces(),
+  ])
+  if (last === null || surfaces.length === 0) return null
+  const coldFor = now - (last + ttlMs)
+  const ctx = usage.context.tokens ?? 0
+  if (coldFor < 0 || ctx < minTokens) return null
+
+  const question =
+    `The prompt cache went cold ${fmtAgo(coldFor)} ago, so this message re-sends the ` +
+    `${fmtTok(ctx)}-token context uncached. Send it anyway?`
+  const answer = await $.ui.ask(question, { options: ['Send', 'Cancel'], header: 'Cold cache' }).catch(() => 'Cancel')
+  if (answer === 'Send') return null
+
+  const lost = hasMedia ? ' Its attachments were not kept.' : ''
+  const copied = await $.ui.copy({ text }).then(r => r.isCopied, () => false)
+  return copied ? `Not sent; your message is on the clipboard.${lost}` : `Not sent.${lost} Your message:\n${text}`
+}
+
 // Sets the one timer for `last`'s expiry, less the lead time
 async function arm($: EngineInterface, last: number) {
   timer?.cancel()
@@ -307,6 +346,7 @@ export const register: Register = (on, options) => {
   ttlMs = (options.cacheTtl === '5m' ? 5 : 60) * MINUTE
   leadMs = options.cacheTtl === '5m' ? 2 * MINUTE : 10 * MINUTE
   if (typeof options.minContextTokens === 'number') minTokens = options.minContextTokens
+  coldGate = options.coldGate !== false
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -325,7 +365,14 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'cache-alert' }, async $ => ({ text: await status($) }))
 
   on('prompt.submit', async ($, e, next) => {
-    if (PERSON.has(e.origin.kind)) fromPerson = true
+    if (!PERSON.has(e.origin.kind)) return next(e)
+    // A slash command or a prompt typed over a running turn passes: the one may not
+    // reach the model, and the other finds the cache warm
+    if (coldGate && !e.command && !e.isMeta && e.turnId === undefined) {
+      const held = await holdCold($, e.text, (e.attachments?.length ?? 0) > 0)
+      if (held !== null) return { drop: held }
+    }
+    fromPerson = true
     return next(e)
   })
 
