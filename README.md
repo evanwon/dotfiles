@@ -43,6 +43,53 @@ The cache timer assumes a one-hour cache. If you use five-minute caching, add
 
 To update: `claude plugin update status-bar`. To remove: `claude plugin uninstall status-bar`.
 
+## Claude Code cache alert: `.claude/mods/cache-alert`
+
+A notification ten minutes before a session's prompt cache goes cold, so you can reply
+while the cache is still warm. Once the cache expires, the next message has to send the
+whole context again at full price.
+
+It only alerts when both of these are true:
+
+- **The session is waiting on you.** Its last turn ended on a question (the desktop
+  app's next-step question, or a final line ending in `?`), is still showing a question
+  or a plan for you to approve, stopped with steps left on its task list, or failed on
+  an API error. A turn that ends with just a summary counts as done. Only a message from
+  you counts as an answer: a turn something else started, like a background task's
+  notice, keeps the session waiting.
+- **The context is large**: at least 75,000 tokens by default. Below that, rebuilding
+  the cache costs little.
+
+You get at most one alert each time a session goes idle. On Windows it's a toast from
+the Claude app that stays on screen until you click it (which opens Claude) or press
+**Dismiss**. Elsewhere it goes through Claude Code's own terminal notification.
+
+Type `/cache-alert` in a session to see whether it would get an alert and to send a
+test notification.
+
+If the cache has already gone cold, the mod asks before your next message goes out:
+it names how long ago the cache went cold and how much context the message re-sends,
+with **Send** and **Cancel**. Cancel holds the message back, and the desktop app keeps
+it in the message box. It only asks when the context meets the same 75,000-token
+threshold, and it skips slash commands, messages typed while Claude is still working,
+and runs where nobody can answer (`claude -p`). Turn it off with `coldGate=false`.
+
+When a session's process starts over, for example when the desktop app relaunches,
+the mod rebuilds what it knew from the session's transcript, so an alert that's still
+due still comes. If you reopen a session inside its last ten minutes, it doesn't alert,
+since you're already there. The rebuild needs `jq` on your `PATH`.
+
+Install it once per machine:
+
+```bash
+claude plugin install cache-alert --marketplace evanwon/dotfiles
+```
+
+Like the status bar, it assumes a one-hour cache. Change that with `cacheTtl=5m`, which
+alerts two minutes ahead instead, and the token threshold with `minContextTokens`. Pass
+either as `--config` to the install command, or change it later with
+`claude plugin configure cache-alert`.
+
 ## Shell and terminal
 
 | File | What it does |
