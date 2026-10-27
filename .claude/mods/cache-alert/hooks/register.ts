@@ -17,6 +17,8 @@ import type { Waiting } from '../types'
 // task's notice, another session, a scheduled prompt) keeps it, unless that turn
 // ends on a question of its own. On Windows the alert is a toast from the Claude app; elsewhere
 // it goes through $.ui.notify, which reaches a terminal.
+// The state lives in the session's process, so a new process (the desktop app
+// relaunched) rebuilds it by replaying the transcript's turns through the same rules.
 
 const MINUTE = 60_000
 const WRAP_UP = 'mcp__ccd_turn__wrap_up'
@@ -41,6 +43,9 @@ let steps: Status[] = []
 let dialog: string | null = null
 // Whether the person sent the prompt the next main-loop turn starts from
 let fromPerson = false
+// Whether a main-loop turn has started in this process, which then knows better
+// than the transcript
+let live = false
 
 // Where a prompt the person sent comes from: the composer, Remote Control, an SDK
 // host, a Slack ping. Everything else (notifications, peers, schedules, follow-ups
@@ -79,6 +84,17 @@ function applyPlan(e: Record<string, unknown>) {
     for (const n of e.done) if (typeof n === 'number' && steps[n - 1]) steps[n - 1] = 'completed'
   }
   if (typeof e.start === 'number' && steps[e.start - 1]) steps[e.start - 1] = 'in_progress'
+}
+
+// What a wrap-up or task-list call says about how the turn will end
+function noteCall(tool: string, e: Record<string, unknown>) {
+  if (tool === WRAP_UP) {
+    wrapped = true
+    ask = typeof e.ask === 'string' && e.ask.trim() !== '' ? e.ask : null
+    steps = steps.map(() => 'completed')
+  } else if (tool === UPDATE_PLAN) {
+    applyPlan(e)
+  }
 }
 
 // What the turn that just ended left the person to do
@@ -169,6 +185,117 @@ async function status($: EngineInterface): Promise<string> {
   ].join('\n')
 }
 
+// --- Recovery from the transcript ---
+
+// The main thread's turns as records, one JSON object a line: a prompt starting a
+// turn (the person's, or a notice's or peer's), a response's time, a wrap-up or
+// task-list call, the end of a text block, an API error, an interrupt. A line that
+// doesn't parse (one still being written) is skipped.
+type Rec =
+  | { k: 'prompt'; person: boolean; turn: number | null }
+  | { k: 'response'; at: string }
+  | { k: 'call'; tool: string; input: Record<string, unknown> }
+  | { k: 'text'; text: string }
+  | { k: 'error' }
+  | { k: 'abort' }
+
+const TURNS_JQ = `inputs | try fromjson catch empty | select(type == "object" and .isSidechain != true)
+| if .type == "user" then
+    if .origin != null then {k: "prompt", person: (.origin.kind == "human"), turn: (.turnPosition.turnIndex // null)}
+    elif (.message.content | type) == "array"
+      and any(.message.content[]; .type == "text" and ((.text // "") | startswith("[Request interrupted by user")))
+    then {k: "abort"}
+    else empty end
+  elif .type == "assistant" then
+    if .isApiErrorMessage == true then {k: "error"}
+    else
+      (select(.message.usage != null and .message.model != "<synthetic>") | {k: "response", at: .timestamp}),
+      (.message.content[]?
+        | if .type == "tool_use" and (.name == "${WRAP_UP}" or .name == "${UPDATE_PLAN}") then {k: "call", tool: .name, input: .input}
+          elif .type == "text" then {k: "text", text: .text[-300:]}
+          else empty end)
+    end
+  else empty end`
+
+const slash = (p: string) => p.replace(/\\/g, '/')
+
+// The session's transcript: ~/.claude/projects/<project slug>/<session id>.jsonl, the
+// slug being the directory it started in with every other character a '-'. A session
+// that has moved since is found by looking through the project folders.
+async function findTranscript($: EngineInterface): Promise<string | null> {
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
+  if (!home) return null
+  const id = await $.session.id()
+  const projects = `${slash(home)}/.claude/projects`
+  const guess = `${projects}/${slash(await $.session.root()).replace(/[^A-Za-z0-9]/g, '-')}/${id}.jsonl`
+  if (await $.fs.exists(guess)) return guess
+  for (const dir of await $.fs.list(projects).catch(() => [])) {
+    const path = `${projects}/${dir.name}/${id}.jsonl`
+    if (dir.kind === 'dir' && (await $.fs.exists(path))) return path
+  }
+  return null
+}
+
+async function readTurns($: EngineInterface): Promise<Rec[] | null> {
+  const path = await findTranscript($)
+  if (path === null) return null
+  const out = await $.process
+    .run(['jq', '-R', '-c', '-n', TURNS_JQ, path], { timeoutMs: 60_000 })
+    .catch(() => null)
+  if (!out || out.exitCode !== 0) return null
+  const recs: Rec[] = []
+  for (const line of out.stdout.split('\n')) {
+    try {
+      if (line.trim()) recs.push(JSON.parse(line) as Rec)
+    } catch {}
+  }
+  return recs
+}
+
+// Rebuilds the last response's time and what the turns left waiting, replaying them
+// the way the hooks saw them. Reopening inside the alert window counts as the alert:
+// the person is looking at the session.
+async function recover($: EngineInterface) {
+  const recs = await readTurns($)
+  if (recs === null || live) return
+  let last = NaN
+  let held: Waiting = null
+  let turn: { n: number | null; reason: string; answer: string } | null = null
+  const end = () => {
+    if (turn) held = turn.reason === 'aborted' ? null : (readEnding(turn.reason, turn.answer) ?? held)
+  }
+  for (const r of recs) {
+    if (r.k === 'response') {
+      last = Date.parse(r.at)
+      if (turn) turn.reason = 'answer'
+    } else if (r.k === 'prompt') {
+      // A prompt folded into the running turn doesn't start one
+      if (turn && r.turn !== null && r.turn === turn.n) continue
+      end()
+      wrapped = false
+      ask = null
+      if (r.person) held = null
+      turn = { n: r.turn, reason: 'answer', answer: '' }
+    } else if (!turn) {
+      continue
+    } else if (r.k === 'call') {
+      noteCall(r.tool, r.input)
+    } else if (r.k === 'text') {
+      turn.answer = r.text
+    } else {
+      turn.reason = r.k === 'error' ? 'error' : 'aborted'
+    }
+  }
+  end()
+  if (Number.isNaN(last) || live) return
+
+  const at = last
+  if ((await $.clock.now()) >= at + ttlMs - leadMs) await update($, alertedFor, () => at)
+  await update($, waiting, () => held)
+  await update($, lastResponseAt, () => at)
+  await arm($, at)
+}
+
 // Sets the one timer for `last`'s expiry, less the lead time
 async function arm($: EngineInterface, last: number) {
   timer?.cancel()
@@ -187,9 +314,11 @@ export const register: Register = (on, options) => {
       name: 'cache-alert',
       description: "Show whether this session would get a cache-expiry alert, and send a test one",
     })
-    // A reload keeps the session's state but cancels the old timer
+    // A reload keeps the session's state but cancels the old timer; a new process
+    // has no state, so it reads it back from the transcript
     const last = await read($, lastResponseAt)
     if (last !== null) await arm($, last)
+    else void recover($)
     return started
   })
 
@@ -202,6 +331,7 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
+      live = true
       wrapped = false
       ask = null
       if (fromPerson) await update($, waiting, () => null)
@@ -222,14 +352,8 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
-    if (e.tool === WRAP_UP) {
-      wrapped = true
-      ask = typeof e.ask === 'string' && e.ask.trim() !== '' ? e.ask : null
-      steps = steps.map(() => 'completed')
-      return next(e)
-    }
-    if (e.tool === UPDATE_PLAN) {
-      applyPlan(e)
+    if (e.tool === WRAP_UP || e.tool === UPDATE_PLAN) {
+      noteCall(e.tool, e)
       return next(e)
     }
     if (e.tool === 'AskUserQuestion' || e.tool === 'ExitPlanMode') {

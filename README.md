@@ -67,6 +67,11 @@ the Claude app that stays on screen until you click it (which opens Claude) or p
 Type `/cache-alert` in a session to see whether it would get an alert and to send a
 test notification.
 
+When a session's process starts over, for example when the desktop app relaunches,
+the mod rebuilds what it knew from the session's transcript, so an alert that's still
+due still comes. If you reopen a session inside its last ten minutes, it doesn't alert,
+since you're already there. The rebuild needs `jq` on your `PATH`.
+
 Install it once per machine:
 
 ```bash

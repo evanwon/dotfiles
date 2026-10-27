@@ -7,13 +7,31 @@ const START = Date.parse('2026-10-26T15:00:00Z')
 
 type Sent = { title?: string; text: string }
 
+const TRANSCRIPT = 'C:/Users/me/.claude/projects/C--src-dotfiles/s1.jsonl'
+
 // The engine beneath the plugin: a session in C:\src\dotfiles with `ctx` tokens of
 // context, a model that answers each step, tools that return at once (but an
 // AskUserQuestion, held until `answer()`), and a notification channel that keeps
-// what it's sent. No OS variable unless given, so not Windows.
-function engine(on: On, { ctx = 240_000, env = {} }: { ctx?: number; env?: Record<string, string> } = {}) {
+// what it's sent. No OS variable unless given, so not Windows. With `transcript`,
+// the session has one on disk, and jq reads it as those records.
+function engine(
+  on: On,
+  { ctx = 240_000, env = {}, transcript }: { ctx?: number; env?: Record<string, string>; transcript?: object[] } = {},
+) {
   const clock = mock.clock(on, { now: START })
-  mock.env(on, env)
+  mock.env(on, transcript ? { ...env, USERPROFILE: 'C:\\Users\\me' } : env)
+  const jq = { runs: 0 }
+  if (transcript) {
+    on('session.id', () => ({ value: 's1' }))
+    on('session.root', () => ({ value: 'C:\\src\\dotfiles' }))
+    on('fs.exists', (_, e) => ({ value: e.path.replace(/\\/g, '/') === TRANSCRIPT }))
+    on('fs.list', () => ({ value: [] }))
+    on('process.run', (_, e) => {
+      if (e.argv[0] === 'jq' && e.argv.at(-1) === TRANSCRIPT) jq.runs += 1
+      const stdout = transcript.map(r => JSON.stringify(r)).join('\n')
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+  }
   const sent: Sent[] = []
   let answer = () => {}
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -42,7 +60,27 @@ function engine(on: On, { ctx = 240_000, env = {} }: { ctx?: number; env?: Recor
     sent.push({ title: e.title, text: e.text })
     return { value: { isSent: true as const, channel: 'iterm2' as const } }
   })
-  return { clock, sent, answer: () => answer() }
+  return { clock, sent, jq, answer: () => answer() }
+}
+
+// Transcript records as the mod's jq pass emits them
+const prompt = (turn: number, person = true) => ({ k: 'prompt', person, turn })
+const response = (minsAgo: number) => ({ k: 'response', at: new Date(START - minsAgo * MINUTE).toISOString() })
+const call = (input: { tool: string }) => {
+  const { tool, ...rest } = input
+  return { k: 'call', tool, input: rest }
+}
+const said = (text: string) => ({ k: 'text', text })
+
+// /cache-alert's first two lines: whether it's waiting, and the cache's time left
+async function standing($: Engine): Promise<string[]> {
+  const out = await $.command.run({
+    command: 'cache-alert',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 120 },
+  })
+  return (out.text ?? '').split('\n').slice(0, 2)
 }
 
 let turns = 0
@@ -205,4 +243,96 @@ test('the five-minute TTL alerts two minutes ahead', { options: { cacheTtl: '5m'
   await turn($, [wrapUp('Commit?')])
   await clock.advance(3 * MINUTE)
   expect(sent.map(s => s.text.split('\n')[0])).toEqual(['dotfiles · 2 min left on a 240k-token cache'])
+})
+
+// A new process (the desktop app relaunched) starts with no state: the transcript
+// stands in for the hooks that ran before it
+
+test('after a restart, the transcript brings back a question left waiting', async ($, on) => {
+  const { clock, sent } = engine(on, {
+    transcript: [prompt(1), response(30), call(wrapUp('Commit?')), said('Done.')],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  await clock.advance(19 * MINUTE)
+  expect(sent).toEqual([])
+  await clock.advance(1 * MINUTE)
+  expect(sent.map(s => s.text)).toEqual(['dotfiles · 10 min left on a 240k-token cache\nCommit?'])
+})
+
+test("the replay keeps the hooks' rules: a turn the person didn't start leaves the question", async ($, on) => {
+  const { clock, sent } = engine(on, {
+    transcript: [
+      prompt(1), response(40), call(wrapUp('Commit?')),
+      prompt(2, false), response(35), call(wrapUp()), said('The build finished.'),
+    ],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  await clock.advance(15 * MINUTE)
+  expect(sent.map(s => s.text.split('\n')[1])).toEqual(['Commit?'])
+})
+
+test("the person's own later turn, ending on a recap, leaves nothing waiting", async ($, on) => {
+  const { clock, sent } = engine(on, {
+    transcript: [prompt(1), response(40), call(wrapUp('Commit?')), prompt(2), response(30), call(wrapUp())],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(await standing($)).toEqual([
+    'Not waiting on you, so no alert.',
+    'Cache goes cold in 30 min (1h TTL); the alert comes 10 min before.',
+  ])
+  await clock.advance(60 * MINUTE)
+  expect(sent.filter(s => s.title === 'Prompt cache expiring')).toEqual([])
+})
+
+test('a last turn that died on an API error is recovered as waiting', async ($, on) => {
+  const { clock, sent } = engine(on, {
+    transcript: [prompt(1), response(30), { k: 'error' }],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  await clock.advance(20 * MINUTE)
+  expect(sent.map(s => s.text.split('\n')[1])).toEqual(['Stopped on an API error'])
+})
+
+test('an interrupted last turn leaves nothing waiting', async ($, on) => {
+  const { clock, sent } = engine(on, {
+    transcript: [prompt(1), response(30), said('Should I go ahead?'), { k: 'abort' }],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(await standing($)).toEqual([
+    'Not waiting on you, so no alert.',
+    'Cache goes cold in 30 min (1h TTL); the alert comes 10 min before.',
+  ])
+  await clock.advance(30 * MINUTE)
+  expect(sent.filter(s => s.title === 'Prompt cache expiring')).toEqual([])
+})
+
+test('reopened inside the alert window: the state is back, but no alert', async ($, on) => {
+  const { clock, sent } = engine(on, {
+    transcript: [prompt(1), response(55), call(wrapUp('Commit?'))],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  await clock.advance(4 * MINUTE)
+  expect(sent).toEqual([])
+  expect(await standing($)).toEqual([
+    'Waiting on you: Commit?',
+    'Cache goes cold in 1 min (1h TTL); the alert comes 10 min before.',
+  ])
+})
+
+test('a session that already holds its state skips the transcript', async ($, on) => {
+  const { clock, jq } = engine(on, { transcript: [] })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(jq.runs).toBe(1)
+  await turn($, [wrapUp('Commit?')])
+  // A hot reload runs session.start again with the state in place
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(jq.runs).toBe(1)
 })
