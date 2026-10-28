@@ -12,11 +12,17 @@ import type { Waiting } from '../types'
 // app's wrap-up ask, a trailing "?" where there's no wrap-up), with a dialog still
 // open (AskUserQuestion, a plan to approve), stopped partway through its task list,
 // or on an API error. A turn that ended with a recap alone is taken as done.
-// One alert per idle stretch: any response re-arms the timer, and only a message from
-// the person clears the waiting state. A turn something else started (a background
-// task's notice, another session, a scheduled prompt) keeps it, unless that turn
-// ends on a question of its own. On Windows the alert is a toast from the Claude app; elsewhere
-// it goes through $.ui.notify, which reaches a terminal.
+// One alert per idle stretch: a turn ending sets it for that response, and only a
+// message from the person clears the waiting state. A turn something else started (a
+// background task's notice, another session, a scheduled prompt) keeps it, unless that
+// turn ends on a question of its own.
+// On Windows the alert is a toast from the Claude app that Windows holds and shows when
+// it's due, so it comes even when the desktop app has shut the session's process down
+// (an idle session under memory pressure, or every session when the app updates
+// itself). The session's sidebar title heads it, and a click opens that session. A
+// running turn takes it back, and the person's own message also clears one already on
+// screen. Elsewhere it's a timer in the process that raises $.ui.notify, which reaches a
+// terminal.
 // The state lives in the session's process, so a new process (the desktop app
 // relaunched) rebuilds it by replaying the transcript's turns through the same rules.
 // Once the cache has gone cold, a message of the person's waits on a question first:
@@ -37,6 +43,13 @@ let leadMs = 10 * MINUTE
 let minTokens = 75_000
 let coldGate = true
 let timer: Timer | null = null
+// What this process last handed Windows, as a key of its time and text: null for
+// nothing, undefined until it has (an earlier process may have left a toast waiting)
+let handed: string | null | undefined = undefined
+// Toast scripts run one at a time, in the order the state changed
+let toasting: Promise<unknown> = Promise.resolve()
+// Whether a main-loop turn is running here; its responses keep the cache warm
+let running = false
 
 // This turn's wrap-up: whether there was one, and the question it asked
 let wrapped = false
@@ -117,32 +130,83 @@ function readEnding(reason: string, answer: string): Waiting {
 // A Windows toast, sent as the Claude app so a click opens it. The reminder scenario
 // keeps it on screen until it's clicked or dismissed (Windows needs a button for
 // that, so it has Dismiss). The text travels in environment variables, so nothing in
-// it is read as PowerShell.
+// it is read as PowerShell. CACHE_ALERT_MODE says what to do:
+//   show        raise it now
+//   schedule    have Windows raise it at CACHE_ALERT_AT (Unix ms), replacing one held
+//   unschedule  take back a held one
+//   clear       that, and take one already shown off the screen
+// The desktop app's record of the session (found by the session id in
+// %APPDATA%\Claude\claude-code-sessions) gives it the sidebar title, and the id that
+// a claude://code/continue link opens it by, which also tags the toast so a later
+// process takes back the same one. A terminal session has no record: it's tagged by
+// its own id, and a click opens the app.
 const TOAST_PS = `
+$ErrorActionPreference = 'Stop'
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+$app = 'Claude_pzs8sxrjxfjjc!Claude'
+$mode = $env:CACHE_ALERT_MODE
+$id = $env:CACHE_ALERT_SESSION
+$rec = $null
+$dir = Join-Path $env:APPDATA 'Claude\\claude-code-sessions'
+if ($id -and (Test-Path -LiteralPath $dir)) {
+  $pattern = '"cliSessionId"\\s*:\\s*"' + [regex]::Escape($id) + '"'
+  $hit = Get-ChildItem -LiteralPath $dir -Recurse -Filter 'local_*.json' -File | Select-String -Pattern $pattern -List | Select-Object -First 1
+  if ($hit) { $rec = Get-Content -Raw -LiteralPath $hit.Path | ConvertFrom-Json }
+}
+$tag = if ($rec) { $rec.sessionId } else { $id }
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app)
+if ($mode -ne 'show') {
+  foreach ($t in @($notifier.GetScheduledToastNotifications())) {
+    if ($t.Group -eq 'cache-alert' -and $t.Tag -eq $tag) { $notifier.RemoveFromSchedule($t) }
+  }
+}
+if ($mode -eq 'clear') { try { [Windows.UI.Notifications.ToastNotificationManager]::History.Remove($tag, 'cache-alert', $app) } catch {} }
+if ($mode -ne 'show' -and $mode -ne 'schedule') { exit 0 }
 $lines = @($env:CACHE_ALERT_TITLE) + ($env:CACHE_ALERT_BODY -split "\\n")
+if ($rec -and $rec.title) { $lines[1] = $rec.title + ' ' + [char]0x00B7 + ' ' + $lines[1] }
 $texts = ($lines | ForEach-Object { "<text>$([System.Security.SecurityElement]::Escape($_))</text>" }) -join ''
+$launch = ''
+if ($rec) { $launch = " activationType='protocol' launch='" + [System.Security.SecurityElement]::Escape('claude://code/continue?session=' + $rec.sessionId) + "'" }
 $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
 $dismiss = "<actions><action activationType='system' arguments='dismiss' content=''/></actions>"
-$xml.LoadXml("<toast scenario='reminder'><visual><binding template='ToastGeneric'>$texts</binding></visual>$dismiss</toast>")
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Claude_pzs8sxrjxfjjc!Claude').Show($toast)
+$xml.LoadXml("<toast scenario='reminder'$launch><visual><binding template='ToastGeneric'>$texts</binding></visual>$dismiss</toast>")
+$at = if ($mode -eq 'schedule') { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$env:CACHE_ALERT_AT) } else { $null }
+if ($at -and $at -gt [DateTimeOffset]::Now.AddSeconds(2)) {
+  $toast = [Windows.UI.Notifications.ScheduledToastNotification]::new($xml, $at)
+  $toast.Tag = $tag
+  $toast.Group = 'cache-alert'
+  $notifier.AddToSchedule($toast)
+} else {
+  $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+  $toast.Tag = $tag
+  $toast.Group = 'cache-alert'
+  $notifier.Show($toast)
+}
 `
 
-// Raises the alert and says how it went out. `$.ui.notify` writes to a terminal, and
-// the desktop app has none (there it only runs the Notification hooks), so Windows
+type Mode = 'show' | 'schedule' | 'unschedule' | 'clear'
+type Alert = { last: number; at: number; title: string; body: string }
+
+async function onWindows($: EngineInterface): Promise<boolean> {
+  return (await $.env.get('OS')) === 'Windows_NT'
+}
+
+// Runs the toast script; resolves whether it ran clean
+async function toast($: EngineInterface, mode: Mode, alert?: Omit<Alert, 'last'>): Promise<boolean> {
+  const env: Record<string, string> = { CACHE_ALERT_MODE: mode, CACHE_ALERT_SESSION: await $.session.id() }
+  if (alert) Object.assign(env, { CACHE_ALERT_TITLE: alert.title, CACHE_ALERT_BODY: alert.body, CACHE_ALERT_AT: String(alert.at) })
+  const out = await $.process
+    .run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', TOAST_PS], { env, timeoutMs: 20_000 })
+    .catch(() => null)
+  return out?.exitCode === 0
+}
+
+// Raises an alert now and says how it went out. `$.ui.notify` writes to a terminal,
+// and the desktop app has none (there it only runs the Notification hooks), so Windows
 // gets a toast of its own, falling back to `$.ui.notify` when that fails.
 async function send($: EngineInterface, title: string, body: string): Promise<string> {
-  if ((await $.env.get('OS')) === 'Windows_NT') {
-    const out = await $.process
-      .run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', TOAST_PS], {
-        env: { CACHE_ALERT_TITLE: title, CACHE_ALERT_BODY: body },
-        timeoutMs: 20_000,
-      })
-      .catch(() => null)
-    if (out?.exitCode === 0) return 'a Windows notification'
-  }
+  if ((await onWindows($)) && (await toast($, 'show', { at: 0, title, body }))) return 'a Windows notification'
   const sent = await $.ui.notify(body, { title })
   return sent.isSent ? `the ${sent.channel} channel` : `nothing (${sent.reason})`
 }
@@ -152,19 +216,58 @@ async function readWaiting($: EngineInterface): Promise<Waiting> {
   return (await read($, waiting)) ?? (dialog === null ? null : { reason: dialog })
 }
 
-async function check($: EngineInterface) {
+// The alert the session's state calls for, or null: waiting on the person, with no
+// turn running (an open dialog aside), a large context, and not yet due or sent
+async function due($: EngineInterface): Promise<Alert | null> {
   const last = await read($, lastResponseAt)
-  if (last === null || (await read($, alertedFor)) === last) return
+  if (last === null || (running && dialog === null) || (await read($, alertedFor)) === last) return null
   const why = await readWaiting($)
-  if (why === null) return
+  if (why === null) return null
   const [now, usage, cwd] = await Promise.all([$.clock.now(), $.session.usage(), $.session.cwd()])
-  const left = last + ttlMs - now
+  const at = last + ttlMs - leadMs
   const ctx = usage.context.tokens ?? 0
-  if (left <= 0 || ctx < minTokens) return
+  if (at <= now || ctx < minTokens) return null
+  const mins = Math.round(leadMs / MINUTE)
+  return {
+    last,
+    at,
+    title: 'Prompt cache expiring',
+    body: `${basename(cwd)} · ${mins} min left on a ${fmtTok(ctx)}-token cache\n${why.reason}`,
+  }
+}
 
-  await update($, alertedFor, () => last)
-  const mins = Math.max(1, Math.round(left / MINUTE))
-  await send($, 'Prompt cache expiring', `${basename(cwd)} · ${mins} min left on a ${fmtTok(ctx)}-token cache\n${why.reason}`)
+// Puts the alert where the session's state says: on Windows a toast handed over to wait
+// for its time, or taken back; elsewhere (or when Windows won't take it) a timer here.
+// `clear` is for the person being back, which also takes down a toast on screen.
+async function sync($: EngineInterface, clear = false) {
+  const alert = await due($)
+  const [now, last] = await Promise.all([$.clock.now(), read($, lastResponseAt)])
+  timer?.cancel()
+  timer = null
+  const arm = (a: Alert) => (timer = $.clock.after(a.at - now, () => void fire($, a)))
+  if (!(await onWindows($))) {
+    if (alert) arm(alert)
+    return
+  }
+  // A toast can only be on screen once an alert time has passed
+  const mayShow = clear && last !== null && last + ttlMs - leadMs <= now
+  const key = alert && `${alert.at}\n${alert.body}`
+  toasting = toasting
+    .then(async () => {
+      if (alert && key !== null) {
+        if (key === handed || (await toast($, 'schedule', alert))) handed = key
+        else arm(alert)
+      } else if (handed !== null || mayShow) {
+        await toast($, mayShow ? 'clear' : 'unschedule')
+        handed = null
+      }
+    })
+    .catch(() => {})
+}
+
+async function fire($: EngineInterface, a: Alert) {
+  await update($, alertedFor, () => a.last)
+  await send($, a.title, a.body)
 }
 
 // /cache-alert: where this session stands, and a test notification
@@ -298,7 +401,7 @@ async function recover($: EngineInterface) {
   if ((await $.clock.now()) >= at + ttlMs - leadMs) await update($, alertedFor, () => at)
   await update($, waiting, () => held)
   await update($, lastResponseAt, () => at)
-  await arm($, at)
+  await sync($)
 }
 
 // Compact span: 12 min, 3 h, 2 days
@@ -331,13 +434,6 @@ async function holdCold($: EngineInterface): Promise<string | null> {
   return answer === 'Send' ? null : 'Not sent: the prompt cache is cold.'
 }
 
-// Sets the one timer for `last`'s expiry, less the lead time
-async function arm($: EngineInterface, last: number) {
-  timer?.cancel()
-  const wait = last + ttlMs - leadMs - (await $.clock.now())
-  timer = $.clock.after(Math.max(0, wait), () => void check($))
-}
-
 export const register: Register = (on, options) => {
   ttlMs = (options.cacheTtl === '5m' ? 5 : 60) * MINUTE
   leadMs = options.cacheTtl === '5m' ? 2 * MINUTE : 10 * MINUTE
@@ -353,7 +449,7 @@ export const register: Register = (on, options) => {
     // A reload keeps the session's state but cancels the old timer; a new process
     // has no state, so it reads it back from the transcript
     const last = await read($, lastResponseAt)
-    if (last !== null) await arm($, last)
+    if (last !== null) await sync($)
     else void recover($)
     return started
   })
@@ -378,6 +474,9 @@ export const register: Register = (on, options) => {
       wrapped = false
       ask = null
       if (fromPerson) await update($, waiting, () => null)
+      // The turn keeps the cache warm, so the alert waits for its end
+      running = true
+      await sync($, fromPerson)
       fromPerson = false
     }
     return next(e)
@@ -388,7 +487,6 @@ export const register: Register = (on, options) => {
     if (result.usage && e.agentId === undefined) {
       const at = await $.clock.now()
       await update($, lastResponseAt, () => at)
-      await arm($, at)
     }
     return result
   })
@@ -401,10 +499,13 @@ export const register: Register = (on, options) => {
     }
     if (e.tool === 'AskUserQuestion' || e.tool === 'ExitPlanMode') {
       dialog = e.tool === 'ExitPlanMode' ? 'A plan is waiting for your approval' : clip(e.questions[0]?.question ?? 'A question is waiting for you')
+      await sync($)
       try {
         return await next(e)
       } finally {
+        // Answered or closed, the person was there
         dialog = null
+        await sync($, true)
       }
     }
     return next(e)
@@ -416,6 +517,8 @@ export const register: Register = (on, options) => {
       // an interrupt means they're there either way
       const w = readEnding(e.reason, e.answer)
       await update($, waiting, held => (e.reason === 'aborted' ? null : (w ?? held)))
+      running = false
+      await sync($, e.reason === 'aborted')
     }
     return next(e)
   })

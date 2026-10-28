@@ -28,6 +28,12 @@ One line above the prompt in Claude Code Desktop. It stays gray until something 
 your attention: context past 50%, or a rate limit past 60%. Click any label to see the
 exact numbers.
 
+The band needs the session's Claude Code process. When memory runs low, the desktop app
+shuts down sessions that have sat idle for half an hour or so, and after the app
+relaunches (it updates itself while you're away), a session's process doesn't start
+until you send it a message. Either way
+the band is gone until your next message starts the process again.
+
 It needs `git` and `jq` on your `PATH`. Install it once per machine:
 
 ```bash
@@ -61,8 +67,10 @@ It only alerts when both of these are true:
   the cache costs little.
 
 You get at most one alert each time a session goes idle. On Windows it's a toast from
-the Claude app that stays on screen until you click it (which opens Claude) or press
-**Dismiss**. Elsewhere it goes through Claude Code's own terminal notification.
+the Claude app, headed by the session's title, that stays on screen until you click it
+(which opens that session in Claude Desktop) or press **Dismiss**. Your next message in
+the session takes it back, or off the screen if it has already shown. Elsewhere it goes
+through Claude Code's own terminal notification.
 
 Type `/cache-alert` in a session to see whether it would get an alert and to send a
 test notification.
@@ -74,10 +82,14 @@ it in the message box. It only asks when the context meets the same 75,000-token
 threshold, and it skips slash commands, messages typed while Claude is still working,
 and runs where nobody can answer (`claude -p`). Turn it off with `coldGate=false`.
 
-When a session's process starts over, for example when the desktop app relaunches,
-the mod rebuilds what it knew from the session's transcript, so an alert that's still
-due still comes. If you reopen a session inside its last ten minutes, it doesn't alert,
-since you're already there. The rebuild needs `jq` on your `PATH`.
+The desktop app shuts down sessions that have sat idle for half an hour or so when
+memory runs low, and after it relaunches (it updates itself while you're away), a
+session's process doesn't start until you send it a message. On Windows the alert still
+comes: when a turn ends, the mod hands the toast to Windows, which shows it at its time
+whether or not the session is running. Elsewhere the alert is a timer in the session's
+process, so a session the app has shut down gets none. When the process starts again,
+the mod rebuilds what it knew from the session's transcript, so the check before
+sending on a cold cache still works. That rebuild needs `jq` on your `PATH`.
 
 Install it once per machine:
 
