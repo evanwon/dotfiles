@@ -1,6 +1,6 @@
 {
   "name": "cache-alert",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A desktop notification shortly before a session's prompt cache goes cold, when that session is waiting on you and has a large context.",
   "license": "MIT",
   "types": "./types/index.d.ts",

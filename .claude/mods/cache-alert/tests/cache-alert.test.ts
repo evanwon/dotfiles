@@ -37,8 +37,8 @@ function engine(
   on('session.surfaces', () => ({ value: surfaces }))
   mock.env(on, transcript ? { ...env, USERPROFILE: 'C:\\Users\\me' } : env)
   const jq = { runs: 0 }
+  on('session.id', () => ({ value: 's1' }))
   if (transcript) {
-    on('session.id', () => ({ value: 's1' }))
     on('session.root', () => ({ value: 'C:\\src\\dotfiles' }))
     on('fs.exists', (_, e) => ({ value: e.path.replace(/\\/g, '/') === TRANSCRIPT }))
     on('fs.list', () => ({ value: [] }))
@@ -242,26 +242,85 @@ test('/cache-alert reports where the session stands and sends a test', async ($,
   expect(sent.map(s => s.title)).toEqual(['Prompt cache alert (test)'])
 })
 
-test('on Windows the alert is a toast through PowerShell', async ($, on) => {
-  const { clock, sent } = engine(on, { env: { OS: 'Windows_NT' } })
-  const runs: { argv: readonly string[]; env?: Record<string, string> }[] = []
+// On Windows: the toast script's runs, as the environment each got, every one ending
+// with `exitCode`
+function windows(on: On, exitCode = 0) {
+  const runs: Record<string, string>[] = []
+  const scripts: string[] = []
   on('process.run', (_, e) => {
-    runs.push({ argv: e.argv, env: e.init?.env })
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0] === 'powershell.exe') {
+      runs.push(e.init?.env ?? {})
+      scripts.push(e.argv.at(-1) ?? '')
+    }
+    return { value: { exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
+  return { runs, scripts, modes: () => runs.map(r => r.CACHE_ALERT_MODE) }
+}
+
+test('on Windows the alert is a toast handed to Windows for its time', async ($, on) => {
+  const { clock, sent } = engine(on, { env: { OS: 'Windows_NT' } })
+  const { runs, scripts, modes } = windows(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await turn($, [wrapUp('Commit?')])
-  await clock.advance(50 * MINUTE)
+  await clock.settle()
 
-  expect(sent).toEqual([])
-  expect(runs.length).toBe(1)
-  expect(runs[0]?.argv[0]).toBe('powershell.exe')
-  // A reminder stays on screen until dismissed
-  expect(runs[0]?.argv.at(-1)).toContain("<toast scenario='reminder'>")
-  expect(runs[0]?.env).toEqual({
+  // The person's turn takes back whatever an earlier process left, then its end hands one over
+  expect(modes()).toEqual(['unschedule', 'schedule'])
+  expect(runs[1]).toEqual({
+    CACHE_ALERT_MODE: 'schedule',
+    CACHE_ALERT_SESSION: 's1',
     CACHE_ALERT_TITLE: 'Prompt cache expiring',
     CACHE_ALERT_BODY: 'dotfiles · 10 min left on a 240k-token cache\nCommit?',
+    CACHE_ALERT_AT: String(START + 50 * MINUTE),
   })
+  // A reminder stays on screen until dismissed; Windows holds it until then
+  expect(scripts[1]).toContain("<toast scenario='reminder'$launch>")
+  expect(scripts[1]).toContain('ScheduledToastNotification')
+
+  // Windows raises it, so nothing here does
+  await clock.advance(60 * MINUTE)
+  expect(sent).toEqual([])
+  expect(runs.length).toBe(2)
+})
+
+test("on Windows the person's next message takes the toast back, or down once it's shown", async ($, on) => {
+  const { clock } = engine(on, { env: { OS: 'Windows_NT' } })
+  const { modes } = windows(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await turn($, [wrapUp('Commit?')])
+  await clock.advance(20 * MINUTE)
+  await turn($, [wrapUp('Push?')])
+  await clock.settle()
+  expect(modes()).toEqual(['unschedule', 'schedule', 'unschedule', 'schedule'])
+
+  // Past its time the toast is on screen, so the answer also clears it
+  await clock.advance(55 * MINUTE)
+  await turn($, [wrapUp()])
+  await clock.settle()
+  expect(modes().slice(4)).toEqual(['clear'])
+})
+
+test("on Windows a turn the person didn't start moves the toast to its own end", async ($, on) => {
+  const { clock } = engine(on, { env: { OS: 'Windows_NT' } })
+  const { runs, modes } = windows(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await turn($, [wrapUp('Commit?')])
+  await clock.advance(20 * MINUTE)
+  await turn($, [], 'The build finished.', 'task-notification')
+  await clock.settle()
+  expect(modes()).toEqual(['unschedule', 'schedule', 'unschedule', 'schedule'])
+  expect(runs[3]?.CACHE_ALERT_AT).toBe(String(START + 70 * MINUTE))
+})
+
+test("when Windows won't take the toast, a timer here raises the alert", async ($, on) => {
+  const { clock, sent } = engine(on, { env: { OS: 'Windows_NT' } })
+  windows(on, 1)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await turn($, [wrapUp('Commit?')])
+  await clock.advance(49 * MINUTE)
+  expect(sent).toEqual([])
+  await clock.advance(1 * MINUTE)
+  expect(sent.map(s => s.text)).toEqual(['dotfiles · 10 min left on a 240k-token cache\nCommit?'])
 })
 
 test('the five-minute TTL alerts two minutes ahead', { options: { cacheTtl: '5m' } }, async ($, on) => {
