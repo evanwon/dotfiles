@@ -62,14 +62,15 @@ It only alerts when both of these are true:
   or a plan for you to approve, stopped with steps left on its task list, or failed on
   an API error. A turn that ends with just a summary counts as done. Only a message from
   you counts as an answer: a turn something else started, like a background task's
-  notice, keeps the session waiting.
+  notice, keeps the session waiting, unless it finishes the task list that was left.
 - **The context is large**: at least 75,000 tokens by default. Below that, rebuilding
   the cache costs little.
 
 You get at most one alert each time a session goes idle. On Windows it's a toast from
 the Claude app, headed by the session's title, that stays on screen until you click it
 (which opens that session in Claude Desktop) or press **Dismiss**. Your next message in
-the session takes it back, or off the screen if it has already shown. Elsewhere it goes
+the session takes it back, or off the screen if it has already shown, and so does
+archiving the session. Elsewhere it goes
 through Claude Code's own terminal notification.
 
 Type `/cache-alert` in a session to see whether it would get an alert and to send a
