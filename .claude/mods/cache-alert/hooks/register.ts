@@ -15,14 +15,14 @@ import type { Waiting } from '../types'
 // One alert per idle stretch: a turn ending sets it for that response, and only a
 // message from the person clears the waiting state. A turn something else started (a
 // background task's notice, another session, a scheduled prompt) keeps it, unless that
-// turn ends on a question of its own.
+// turn ends on a question of its own or finishes the task list that was left.
 // On Windows the alert is a toast from the Claude app that Windows holds and shows when
 // it's due, so it comes even when the desktop app has shut the session's process down
 // (an idle session under memory pressure, or every session when the app updates
 // itself). The session's sidebar title heads it, and a click opens that session. A
-// running turn takes it back, and the person's own message also clears one already on
-// screen. Elsewhere it's a timer in the process that raises $.ui.notify, which reaches a
-// terminal.
+// running turn takes it back, and the person's own message, or archiving the session,
+// also clears one already on screen. Elsewhere it's a timer in the process that raises
+// $.ui.notify, which reaches a terminal.
 // The state lives in the session's process, so a new process (the desktop app
 // relaunched) rebuilds it by replaying the transcript's turns through the same rules.
 // Once the cache has gone cold, a message of the person's waits on a question first:
@@ -48,6 +48,8 @@ let timer: Timer | null = null
 let handed: string | null | undefined = undefined
 // Toast scripts run one at a time, in the order the state changed
 let toasting: Promise<unknown> = Promise.resolve()
+// Where the desktop app keeps its record of this session, once a toast script found it
+let record: string | null = null
 // Whether a main-loop turn is running here; its responses keep the cache warm
 let running = false
 
@@ -115,16 +117,28 @@ function noteCall(tool: string, e: Record<string, unknown>) {
   }
 }
 
+const STEPS_LEFT = 'Stopped with steps left on its task list'
+
 // What the turn that just ended left the person to do
 function readEnding(reason: string, answer: string): Waiting {
   if (reason === 'aborted') return null // they stopped it, so they're there
   if (reason === 'error') return { reason: 'Stopped on an API error' }
   if (ask) return { reason: clip(ask) }
   if (wrapped) return null
-  if (steps.some(s => s !== 'completed')) return { reason: 'Stopped with steps left on its task list' }
+  if (steps.some(s => s !== 'completed')) return { reason: STEPS_LEFT }
   const lastLine = answer.trim().split('\n').at(-1) ?? ''
   if (lastLine.trim().endsWith('?')) return { reason: clip(lastLine) }
   return null
+}
+
+// What's waiting once a turn has ended: what it left, else what was waiting before it
+// (a turn the person didn't start doesn't answer their question). A task list that
+// the later turn finished no longer waits, as when a turn stops with steps in progress
+// for a background task, and the task's notice starts the turn that finishes them.
+function carry(held: Waiting, ending: Waiting): Waiting {
+  if (ending) return ending
+  if (held?.reason === STEPS_LEFT && steps.every(s => s === 'completed')) return null
+  return held
 }
 
 // A Windows toast, sent as the Claude app so a click opens it. The reminder scenario
@@ -139,7 +153,9 @@ function readEnding(reason: string, answer: string): Waiting {
 // %APPDATA%\Claude\claude-code-sessions) gives it the sidebar title, and the id that
 // a claude://code/continue link opens it by, which also tags the toast so a later
 // process takes back the same one. A terminal session has no record: it's tagged by
-// its own id, and a click opens the app.
+// its own id, and a click opens the app. The search takes most of a second, so the
+// script prints the record's path (record=...) and takes it back as
+// CACHE_ALERT_RECORD.
 const TOAST_PS = `
 $ErrorActionPreference = 'Stop'
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
@@ -148,13 +164,21 @@ $app = 'Claude_pzs8sxrjxfjjc!Claude'
 $mode = $env:CACHE_ALERT_MODE
 $id = $env:CACHE_ALERT_SESSION
 $rec = $null
-$dir = Join-Path $env:APPDATA 'Claude\\claude-code-sessions'
-if ($id -and (Test-Path -LiteralPath $dir)) {
+$path = $env:CACHE_ALERT_RECORD
+# .NET calls, not Join-Path and Test-Path, which load a module: a third of a second
+$dir = [System.IO.Path]::Combine($env:APPDATA, 'Claude', 'claude-code-sessions')
+if (-not ($path -and [System.IO.File]::Exists($path)) -and $id -and [System.IO.Directory]::Exists($dir)) {
   $pattern = '"cliSessionId"\\s*:\\s*"' + [regex]::Escape($id) + '"'
   $hit = Get-ChildItem -LiteralPath $dir -Recurse -Filter 'local_*.json' -File | Select-String -Pattern $pattern -List | Select-Object -First 1
-  if ($hit) { $rec = Get-Content -Raw -LiteralPath $hit.Path | ConvertFrom-Json }
+  $path = if ($hit) { $hit.Path } else { $null }
 }
-$tag = if ($rec) { $rec.sessionId } else { $id }
+$tag = $id
+if ($path) {
+  "record=$path"
+  # The record is named for the app's session id; its text (half a MB) is read only for a toast going out
+  $tag = [System.IO.Path]::GetFileNameWithoutExtension($path)
+  if ($mode -eq 'show' -or $mode -eq 'schedule') { $rec = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json }
+}
 $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app)
 if ($mode -ne 'show') {
   foreach ($t in @($notifier.GetScheduledToastNotifications())) {
@@ -195,11 +219,20 @@ async function onWindows($: EngineInterface): Promise<boolean> {
 // Runs the toast script; resolves whether it ran clean
 async function toast($: EngineInterface, mode: Mode, alert?: Omit<Alert, 'last'>): Promise<boolean> {
   const env: Record<string, string> = { CACHE_ALERT_MODE: mode, CACHE_ALERT_SESSION: await $.session.id() }
+  if (record !== null) env.CACHE_ALERT_RECORD = record
   if (alert) Object.assign(env, { CACHE_ALERT_TITLE: alert.title, CACHE_ALERT_BODY: alert.body, CACHE_ALERT_AT: String(alert.at) })
   const out = await $.process
     .run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', TOAST_PS], { env, timeoutMs: 20_000 })
     .catch(() => null)
+  const found = out?.stdout.match(/^record=(.+?)\r?$/m)?.[1]
+  if (found) record = found
   return out?.exitCode === 0
+}
+
+// Whether the desktop app's record says the session is archived
+async function archived($: EngineInterface, path: string): Promise<boolean> {
+  const rec = await $.fs.read(path).then(t => JSON.parse(t) as { isArchived?: unknown }, () => null)
+  return rec?.isArchived === true
 }
 
 // Raises an alert now and says how it went out. `$.ui.notify` writes to a terminal,
@@ -370,7 +403,7 @@ async function recover($: EngineInterface) {
   let held: Waiting = null
   let turn: { n: number | null; reason: string; answer: string } | null = null
   const end = () => {
-    if (turn) held = turn.reason === 'aborted' ? null : (readEnding(turn.reason, turn.answer) ?? held)
+    if (turn) held = turn.reason === 'aborted' ? null : carry(held, readEnding(turn.reason, turn.answer))
   }
   for (const r of recs) {
     if (r.k === 'response') {
@@ -454,6 +487,19 @@ export const register: Register = (on, options) => {
     return started
   })
 
+  // Archiving a session ends its process the same way (reason `other`) as the app's
+  // own shutdowns of idle sessions, which the toast is handed to Windows to outlive;
+  // the app's record, already marked, tells them apart. The engine gives this hook
+  // 1.5 s, so it only acts on a record a toast script already found (Windows only).
+  on('session.end', async ($, e, next) => {
+    if (record !== null && handed !== null && (await archived($, record))) {
+      await toasting
+      await toast($, 'clear')
+      handed = null
+    }
+    return next(e)
+  })
+
   on('command.run', { command: 'cache-alert' }, async $ => ({ text: await status($) }))
 
   on('prompt.submit', async ($, e, next) => {
@@ -513,10 +559,9 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
-      // A turn the person didn't start leaves what it found unless it asks anew;
-      // an interrupt means they're there either way
+      // An interrupt means they're there either way
       const w = readEnding(e.reason, e.answer)
-      await update($, waiting, held => (e.reason === 'aborted' ? null : (w ?? held)))
+      await update($, waiting, held => (e.reason === 'aborted' ? null : carry(held, w)))
       running = false
       await sync($, e.reason === 'aborted')
     }

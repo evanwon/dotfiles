@@ -51,6 +51,7 @@ function engine(
   const sent: Sent[] = []
   let answer = () => {}
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.cwd', () => ({ value: 'C:\\src\\dotfiles' }))
   on('session.usage', () => ({
     value: { startedAt: START, context: { tokens: ctx, window: 1_000_000, percent: ctx / 10_000 }, rateLimits: [] },
@@ -185,6 +186,20 @@ test("a turn the person didn't start keeps the question waiting", async ($, on) 
   expect(sent.map(s => s.text.split('\n')[1])).toEqual(['Commit?'])
 })
 
+// A turn that leaves its task list running while a background task works, then the
+// task's notice starting the turn that finishes the list
+const pushing = { tool: 'mcp__ccd_turn__update_plan', items: [{ content: 'Push', status: 'in_progress' }, { content: 'Confirm', status: 'pending' }] }
+
+test("a later turn that finishes the task list isn't left waiting on it", async ($, on) => {
+  const { clock, sent } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await turn($, [pushing], "The push is running; I'll confirm when it lands.")
+  await clock.advance(6 * MINUTE)
+  await turn($, [wrapUp()], 'Pushed.', 'task-notification')
+  await clock.advance(60 * MINUTE)
+  expect(sent).toEqual([])
+})
+
 test('an open AskUserQuestion counts as waiting', async ($, on) => {
   const { clock, sent, answer } = engine(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
@@ -242,9 +257,12 @@ test('/cache-alert reports where the session stands and sends a test', async ($,
   expect(sent.map(s => s.title)).toEqual(['Prompt cache alert (test)'])
 })
 
+// The desktop app's record of the session, as the toast script reports finding it
+const RECORD = 'C:\\Users\\me\\AppData\\Roaming\\Claude\\claude-code-sessions\\a\\b\\local_1.json'
+
 // On Windows: the toast script's runs, as the environment each got, every one ending
-// with `exitCode`
-function windows(on: On, exitCode = 0) {
+// with `exitCode`. Each finds the app's record, which says `isArchived`.
+function windows(on: On, exitCode = 0, { isArchived = false } = {}) {
   const runs: Record<string, string>[] = []
   const scripts: string[] = []
   on('process.run', (_, e) => {
@@ -252,10 +270,17 @@ function windows(on: On, exitCode = 0) {
       runs.push(e.init?.env ?? {})
       scripts.push(e.argv.at(-1) ?? '')
     }
-    return { value: { exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const stdout = e.argv[0] === 'powershell.exe' ? `record=${RECORD}\r\n` : ''
+    return { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('fs.read', (_, e) => {
+    if (e.path !== RECORD) throw new Error(`ENOENT: ${e.path}`)
+    return { value: JSON.stringify({ sessionId: 'local_1', cliSessionId: 's1', isArchived }) }
   })
   return { runs, scripts, modes: () => runs.map(r => r.CACHE_ALERT_MODE) }
 }
+
+const end = ($: Engine) => $.session.end({ reason: 'other', sessionId: 's1', resume: { id: 's1' } })
 
 test('on Windows the alert is a toast handed to Windows for its time', async ($, on) => {
   const { clock, sent } = engine(on, { env: { OS: 'Windows_NT' } })
@@ -269,6 +294,8 @@ test('on Windows the alert is a toast handed to Windows for its time', async ($,
   expect(runs[1]).toEqual({
     CACHE_ALERT_MODE: 'schedule',
     CACHE_ALERT_SESSION: 's1',
+    // Found by the first run, so this one skips the search
+    CACHE_ALERT_RECORD: RECORD,
     CACHE_ALERT_TITLE: 'Prompt cache expiring',
     CACHE_ALERT_BODY: 'dotfiles · 10 min left on a 240k-token cache\nCommit?',
     CACHE_ALERT_AT: String(START + 50 * MINUTE),
@@ -310,6 +337,29 @@ test("on Windows a turn the person didn't start moves the toast to its own end",
   await clock.settle()
   expect(modes()).toEqual(['unschedule', 'schedule', 'unschedule', 'schedule'])
   expect(runs[3]?.CACHE_ALERT_AT).toBe(String(START + 70 * MINUTE))
+})
+
+test('on Windows archiving the session takes its toast back', async ($, on) => {
+  const { clock } = engine(on, { env: { OS: 'Windows_NT' } })
+  const { runs, modes } = windows(on, 0, { isArchived: true })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await turn($, [wrapUp('Commit?')])
+  await clock.settle()
+  await end($)
+  // Or down off the screen, had it shown already; the record found when it was
+  // handed over saves the search
+  expect(modes()).toEqual(['unschedule', 'schedule', 'clear'])
+  expect(runs[2]?.CACHE_ALERT_RECORD).toBe(RECORD)
+})
+
+test("on Windows the app shutting the session down leaves its toast with Windows", async ($, on) => {
+  const { clock } = engine(on, { env: { OS: 'Windows_NT' } })
+  const { modes } = windows(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await turn($, [wrapUp('Commit?')])
+  await clock.settle()
+  await end($)
+  expect(modes()).toEqual(['unschedule', 'schedule'])
 })
 
 test("when Windows won't take the toast, a timer here raises the alert", async ($, on) => {
@@ -357,6 +407,20 @@ test("the replay keeps the hooks' rules: a turn the person didn't start leaves t
   await clock.settle()
   await clock.advance(15 * MINUTE)
   expect(sent.map(s => s.text.split('\n')[1])).toEqual(['Commit?'])
+})
+
+test('the replay drops a task list that a later turn finished', async ($, on) => {
+  const { clock, sent } = engine(on, {
+    transcript: [
+      prompt(1), response(40), call(pushing), said("The push is running; I'll confirm when it lands."),
+      prompt(2, false), response(34), call(wrapUp()), said('Pushed.'),
+    ],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect((await standing($))[0]).toBe('Not waiting on you, so no alert.')
+  await clock.advance(60 * MINUTE)
+  expect(sent.filter(s => s.title === 'Prompt cache expiring')).toEqual([])
 })
 
 test("the person's own later turn, ending on a recap, leaves nothing waiting", async ($, on) => {
